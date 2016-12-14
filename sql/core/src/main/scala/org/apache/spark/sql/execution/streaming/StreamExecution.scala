@@ -223,7 +223,8 @@ class StreamExecution(
         sparkSession.sparkContext.env.metricsSystem.registerSource(streamMetrics)
       }
 
-      postEvent(new QueryStartedEvent(id, runId, name)) // Assumption: Does not throw exception.
+      // `postEvent` does not throw non fatal exception.
+      postEvent(new QueryStartedEvent(id, runId, name))
 
       // Unblock starting thread
       startLatch.countDown()
@@ -286,7 +287,7 @@ class StreamExecution(
           e,
           committedOffsets.toOffsetSeq(sources, offsetSeqMetadata).toString,
           availableOffsets.toOffsetSeq(sources, offsetSeqMetadata).toString)
-        logError(s"Query $name terminated with error", e)
+        logError(s"Query $prettyIdString terminated with error", e)
         updateStatusMessage(s"Terminated with exception: ${e.getMessage}")
         // Rethrow the fatal errors to allow the user using `Thread.UncaughtExceptionHandler` to
         // handle them
@@ -381,6 +382,24 @@ class StreamExecution(
     if (hasNewData) {
       // Current batch timestamp in milliseconds
       offsetSeqMetadata.batchTimestampMs = triggerClock.getTimeMillis()
+      // Update the eventTime watermark if we find one in the plan.
+      if (lastExecution != null) {
+        lastExecution.executedPlan.collect {
+          case e: EventTimeWatermarkExec if e.eventTimeStats.value.count > 0 =>
+            logDebug(s"Observed event time stats: ${e.eventTimeStats.value}")
+            e.eventTimeStats.value.max - e.delay.milliseconds
+        }.headOption.foreach { newWatermarkMs =>
+          if (newWatermarkMs > offsetSeqMetadata.batchWatermarkMs) {
+            logInfo(s"Updating eventTime watermark to: $newWatermarkMs ms")
+            offsetSeqMetadata.batchWatermarkMs = newWatermarkMs
+          } else {
+            logDebug(
+              s"Event time didn't move: $newWatermarkMs < " +
+                s"${offsetSeqMetadata.batchWatermarkMs}")
+          }
+        }
+      }
+
       updateStatusMessage("Writing offsets to log")
       reportTimeTaken("walCommit") {
         assert(offsetLog.add(
@@ -482,21 +501,6 @@ class StreamExecution(
 
     reportTimeTaken("addBatch") {
       sink.addBatch(currentBatchId, nextBatch)
-    }
-
-    // Update the eventTime watermark if we find one in the plan.
-    lastExecution.executedPlan.collect {
-      case e: EventTimeWatermarkExec =>
-        logTrace(s"Maximum observed eventTime: ${e.maxEventTime.value}")
-        (e.maxEventTime.value / 1000) - e.delay.milliseconds()
-    }.headOption.foreach { newWatermark =>
-      if (newWatermark > offsetSeqMetadata.batchWatermarkMs) {
-        logInfo(s"Updating eventTime watermark to: $newWatermark ms")
-        offsetSeqMetadata.batchWatermarkMs = newWatermark
-      } else {
-        logTrace(s"Event time didn't move: $newWatermark < " +
-          s"$offsetSeqMetadata.currentEventTimeWatermark")
-      }
     }
 
     awaitBatchLock.lock()
